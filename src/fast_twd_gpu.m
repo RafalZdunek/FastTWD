@@ -1,10 +1,10 @@
-function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
+function [X_hat, G, Core, Out] = fast_twd_gpu(X, Omega, opts)
 
 % fast_twd_gpu: GPU/CPU fast implementation of Tensor Wheel (TW) decomposition.
 %
-% This routine approximates an Nth-order tensor F by the TW representation:
+% This routine approximates an Nth-order tensor X by the TW representation:
 %
-%       X = TW({G_k}_{k=1}^N; C),
+%       X_hat = TW({G_k}_{k=1}^N; C),
 %
 % where the TW factors consist of:
 %
@@ -17,7 +17,7 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %         C in R^{L_1 x L_2 x ... x L_N}.
 %
 % The cyclic convention is R_{N+1}=R_1. The quantities R_k and L_k are the
-% outer and inner ranks, respecively. 
+% outer and inner ranks, respectively.
 %
 % -------------------------------------------------------------------------
 % MODEL
@@ -28,7 +28,7 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %
 %   - updates the ring factors G_k, k = 1,...,N,
 %   - periodically updates the core factor C,
-%   - reconstructs the dense tensor approximation Xhat,
+%   - reconstructs the dense tensor approximation X_hat,
 %   - updates the working tensor Xwork using a proximal/relaxed step,
 %   - monitors convergence by an internal relative-change criterion.
 %
@@ -41,16 +41,17 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %         GPU by default when opts.core_solve_on_gpu=true,
 %         with optional CPU fallback;
 %
-%   - dense reconstruction Xhat:
-%         CPU reconstruction using the project helper when available,
-%         followed by transfer to GPU if required.
+%   - dense reconstruction X_hat:
+%         CPU reconstruction using a local helper based on
+%         tensor_contraction_explicit, followed by transfer to the GPU
+%         when required.
 %
 % -------------------------------------------------------------------------
 % CALLING SYNTAX
 % -------------------------------------------------------------------------
 %
-%   [X,G,Core,Out] = fast_twd_gpu(F, opts)
-%   [X,G,Core,Out] = fast_twd_gpu(F, Omega, opts)
+%   [X_hat,G,Core,Out] = fast_twd_gpu(X, opts)
+%   [X_hat,G,Core,Out] = fast_twd_gpu(X, Omega, opts)
 %
 % Omega is accepted for compatibility with tensor-completion interfaces.
 % In the current dense implementation, Omega is ignored.
@@ -59,22 +60,25 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 % INPUT ARGUMENTS
 % -------------------------------------------------------------------------
 %
-% F
+% X
 %   Dense input tensor to be approximated.
 %
 %   Size:
-%       F is an Nth-order tensor:
+%       X is an Nth-order tensor:
 %
-%           F in R^{I_1 x I_2 x ... x I_N}.
+%           X in R^{I_1 x I_2 x ... x I_N}.
 %
 %       Here:
 %
-%           N   = ndims(F),
-%           I_k = size(F,k).
+%           N   = size(opts.R, 2),
+%           I_k = size(X, k).
+%
+%       The tensor order is determined from opts.R so that trailing
+%       physical dimensions of size one are preserved.
 %
 %   Type:
 %       Numeric MATLAB array, typically double or single.
-%       If opts.use_gpu=true, F is internally transferred to gpuArray.
+%       If opts.use_gpu=true, X is internally transferred to gpuArray.
 %
 % Omega
 %   Optional compatibility argument for tensor-completion-style interfaces.
@@ -110,11 +114,11 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 % OUTPUT ARGUMENTS
 % -------------------------------------------------------------------------
 %
-% X
+% X_hat
 %   Dense reconstructed tensor.
 %
 %   Size:
-%       same as F:
+%       same as X:
 %
 %           I_1 x I_2 x ... x I_N.
 %
@@ -154,12 +158,35 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %
 %   Main fields:
 %
+%       Out.RES_init
+%           Initial relative residual
+%
+%               norm(X(:) - Y0(:)) / norm(Y0(:)),
+%
+%           where Y0 is the TW tensor reconstructed from the initial
+%           factors and core.
+%
 %       Out.RSE
 %           Internal relative-change history, typically of the form
 %
 %               norm(Xwork^{t+1} - Xwork^t)_F / norm(Xwork^t)_F.
 %
 %           This is the stopping criterion controlled by opts.tol.
+%
+%       Out.iterations
+%           Number of PAM iterations executed before termination.
+%
+%       Out.converged
+%           Logical flag indicating whether the relative-change stopping
+%           criterion was satisfied.
+%
+%       Out.final_R
+%           Final 2-by-N matrix of TW ranks:
+%
+%               Out.final_R(1,:) = [R_1, ..., R_N]   outer ranks,
+%               Out.final_R(2,:) = [L_1, ..., L_N]   inner ranks.
+%
+%           The current GPU implementation uses the fixed ranks opts.R.
 %
 %       Out.did_core
 %           Logical vector indicating whether the core factor C was updated
@@ -187,7 +214,7 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %       Out.RSE is an internal convergence measure. It is not necessarily the
 %       same quantity as the reconstruction residual:
 %
-%           RES = norm(F(:) - X(:)) / norm(F(:)).
+%           RES = norm(X(:) - X_hat(:)) / norm(X(:)).
 %
 % -------------------------------------------------------------------------
 % OPTIONS
@@ -203,6 +230,9 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %   tol                - stopping tolerance for internal relative change,
 %                        default 1e-6
 %   maxit              - maximum number of iterations, default 500
+%   seed               - nonnegative integer seed used for reproducible
+%                        initialization of the TW factors and core with
+%                        the Mersenne Twister generator, default 0
 %   core_update_after  - first iteration after which scheduled core updates
 %                        are allowed, default 3
 %   core_update_every  - period of core updates after core_update_after,
@@ -211,7 +241,7 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %                        updates, default 1
 %   precision          - 'double' (default), 'single', or 'mixed'
 %   use_gpu            - true (default); if false, CPU execution is used
-%   gather_output      - true (default); gather X, G, and Core to CPU before
+%   gather_output      - true (default); gather X_hat, G, and Core to CPU before
 %                        returning
 %   enable_core        - true (default); enable scheduled core-factor updates
 %   enable_symmetrize  - true (default); symmetrize Gram matrices before
@@ -237,17 +267,12 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 % REQUIRED / OPTIONAL PROJECT HELPERS
 % -------------------------------------------------------------------------
 %
-% Required helper on MATLAB path:
+% Required helper on the MATLAB path:
 %
-%   tensor_contraction
+%   tensor_contraction_explicit
 %
-% Optional helper on MATLAB path:
-%
-%   cores_prod_single_tw
-%
-% If cores_prod_single_tw is available, it is preferred for CPU
-% reconstruction. Otherwise, the implementation falls back to an internal
-% generic reconstruction routine.
+% Dense TW reconstruction is performed by a local helper contained in this
+% file. No external reconstruction helper is required.
 %
 % -------------------------------------------------------------------------
 % NOTES
@@ -258,39 +283,51 @@ function [X, G, Core, Out] = fast_twd_gpu(F, Omega, opts)
 %   - The implementation is designed to reproduce the mathematical update
 %     logic of the CPU fast TWD solver while accelerating ring-factor and
 %     core-factor subproblems on GPU.
-%   - If opts.use_gpu=false, the same algorithmic logic is executed on CPU.%   
+%   - If opts.use_gpu=false, the same algorithmic logic is executed on CPU.   
 % =========================================================================
 %
 % -------------------------------------------------------------------------
 % Parse input arguments
 % Supported call forms:
-%   fast_twd_gpu(F, opts)
-%   fast_twd_gpu(F, Omega, opts)
+%   fast_twd_gpu(X, opts)
+%   fast_twd_gpu(X, Omega, opts)
 % -------------------------------------------------------------------------
 
-if nargin == 1
+if nargin < 2
     error('fast_twd_gpu:MissingOptions', ...
-        ['Missing opts argument. Supported calls are:\n', ...
-         '  [X,G,Core,Out] = fast_twd_gpu(F, opts)\n', ...
-         '  [X,G,Core,Out] = fast_twd_gpu(F, Omega, opts)']);
+        ['fast_twd_gpu requires at least X and opts. ', ...
+         'Supported calls are:\n', ...
+         '  [X_hat,G,Core,Out] = fast_twd_gpu(X, opts)\n', ...
+         '  [X_hat,G,Core,Out] = fast_twd_gpu(X, Omega, opts)']);
 
 elseif nargin == 2
-    % Two-argument call: second input is opts
+    % Two-argument call: the second input is opts.
     opts = Omega;
-    Omega = [];
 
 elseif nargin == 3
-    % Three-argument call: second input is Omega, third input is opts
-    % Omega is accepted for interface compatibility and ignored in dense mode.
+    % Three-argument call: Omega is accepted for interface compatibility
+    % and ignored in the current dense implementation.
 
 else
     error('fast_twd_gpu:TooManyInputs', ...
-        'Too many input arguments. Supported calls are fast_twd_gpu(F, opts) and fast_twd_gpu(F, Omega, opts).');
+        ['Supported calls are fast_twd_gpu(X, opts) and ', ...
+         'fast_twd_gpu(X, Omega, opts).']);
 end
 
-if ~isstruct(opts)
-    error('fast_twd_gpu:InvalidOptions', ...
-        'opts must be a structure containing at least the field opts.R.');
+if ~isstruct(opts) || ~isscalar(opts)
+    error('fast_twd_gpu:InvalidOptions', 'opts must be a scalar structure.');
+end
+
+if isa(X, 'gpuArray')
+    error('fast_twd_gpu:GpuArrayInput', ...
+        ['X must be supplied as a CPU array. The solver transfers X ', ...
+         'to the GPU internally when opts.use_gpu is true.']);
+end
+
+if isempty(X) || ~isnumeric(X) || ~isreal(X) || ...
+        ~(isa(X, 'double') || isa(X, 'single'))
+    error('fast_twd_gpu:InvalidInputTensor', ...
+        'X must be a nonempty real tensor of class single or double.');
 end
 
 if ~isfield(opts, 'R') || isempty(opts.R)
@@ -304,6 +341,7 @@ p = parse_opts_gpu(opts);
 tol                = p.tol;
 maxit              = p.maxit;
 rho                = p.rho;
+seed               = p.seed;
 core_update_after  = p.core_update_after;
 core_update_every  = p.core_update_every;
 relax              = p.relax;
@@ -317,19 +355,124 @@ enable_symmetrize  = p.enable_symmetrize;
 core_solve_on_gpu   = p.core_solve_on_gpu;
 
 %% ---------------------- tensor-wheel dimensions -------------------------
-Ndim = ndims(F);
-Nway = size(F);
-
-if ~isfield(opts, 'R')
-    error('opts.R must be provided as a 2xN matrix: [R; L].');
-end
 RL = opts.R;
-if size(RL,1) ~= 2 || size(RL,2) ~= Ndim
-    error('opts.R must have size 2xN, where N = ndims(F).');
+
+if ~isnumeric(RL) || ~isreal(RL) || ~ismatrix(RL) || ...
+        size(RL,1) ~= 2 || size(RL,2) < 2
+    error('fast_twd_gpu:InvalidRankSize', ...
+        ['opts.R must be a real 2-by-N matrix of outer and inner ', ...
+         'TW ranks, with N >= 2.']);
 end
 
-L = RL(2,1:Ndim);
+if any(~isfinite(RL(:))) || ...
+        any(RL(:) < 1) || ...
+        any(RL(:) ~= fix(RL(:)))
+    error('fast_twd_gpu:InvalidRanks', ...
+        'All entries of opts.R must be finite positive integers.');
+end
+
+% Determine the logical tensor order from opts.R. This preserves possible
+% trailing physical dimensions of size one.
+Ndim = size(RL, 2);
+
+Nway = ones(1, Ndim);
+for n = 1:Ndim
+    Nway(n) = size(X, n);
+end
+
+% Reject additional non-singleton physical dimensions not represented
+% by opts.R.
+sizeX = size(X);
+if numel(sizeX) > Ndim && any(sizeX(Ndim+1:end) ~= 1)
+    error('fast_twd_gpu:InconsistentTensorOrder', ...
+        ['The number of physical modes of X is inconsistent with ', ...
+         'the number of columns in opts.R.']);
+end
+
+L = RL(2,:);
 Factors_dims = factor_dims(Nway, RL);
+
+%% ------------------------- option validation ----------------------------
+
+validateattributes(tol, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'positive'}, ...
+    mfilename, 'opts.tol');
+
+validateattributes(maxit, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'integer', 'positive'}, ...
+    mfilename, 'opts.maxit');
+
+validateattributes(rho, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'positive'}, ...
+    mfilename, 'opts.rho');
+
+validateattributes(seed, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'integer', 'nonnegative'}, ...
+    mfilename, 'opts.seed');
+
+if seed > 2^32 - 1
+    error('fast_twd_gpu:InvalidSeed', ...
+        'opts.seed must not exceed 2^32-1.');
+end
+
+validateattributes(core_update_after, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'integer', 'nonnegative'}, ...
+    mfilename, 'opts.core_update_after');
+
+validateattributes(core_update_every, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'integer', 'positive'}, ...
+    mfilename, 'opts.core_update_every');
+
+validateattributes(relax, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'positive'}, ...
+    mfilename, 'opts.relax');
+
+validateattributes(check_every, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'integer', 'positive'}, ...
+    mfilename, 'opts.check_every');
+
+validateattributes(verbose_every, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'integer', 'positive'}, ...
+    mfilename, 'opts.verbose_every');
+
+% Accept either a character vector or a scalar string.
+if isstring(precision_mode)
+    if ~isscalar(precision_mode)
+        error('fast_twd_gpu:InvalidPrecision', ...
+            'opts.precision must be a scalar string or character vector.');
+    end
+    precision_mode = char(precision_mode);
+end
+
+if ~ischar(precision_mode) || ...
+        ~ismember(lower(precision_mode), {'double', 'single', 'mixed'})
+    error('fast_twd_gpu:InvalidPrecision', ...
+        ['opts.precision must be ''double'', ''single'', ', ...
+         'or ''mixed''.']);
+end
+
+precision_mode = lower(precision_mode);
+
+logicalNames = { ...
+    'use_gpu', ...
+    'gather_output', ...
+    'enable_core', ...
+    'enable_symmetrize', ...
+    'core_solve_on_gpu'};
+
+logicalValues = { ...
+    use_gpu, ...
+    gather_output, ...
+    enable_core, ...
+    enable_symmetrize, ...
+    core_solve_on_gpu};
+
+for q = 1:numel(logicalNames)
+    if ~islogical(logicalValues{q}) || ~isscalar(logicalValues{q})
+        error('fast_twd_gpu:InvalidLogicalOption', ...
+            'opts.%s must be a logical scalar.', logicalNames{q});
+    end
+end
 
 %% -------------------------- device / dtype ------------------------------
 [dtype, core_cpu_dtype] = get_dtypes_from_precision(precision_mode);
@@ -340,13 +483,13 @@ if use_gpu
     end
 end
 
-Xwork = cast(F, dtype);
+Xwork = cast(X, dtype);
 if use_gpu
     Xwork = gpuArray(Xwork);
 end
 
 %% ----------------------------- init -------------------------------------
-rng('default');
+rng(seed, 'twister');
 Gwork = cell(Ndim,1);
 for n = 1:Ndim
     Gwork{n} = rand_gpu_or_cpu(Factors_dims(n,:), dtype, use_gpu);
@@ -363,9 +506,22 @@ Out.time_total     = zeros(maxit,1);
 Out.stop_iter      = maxit;
 Out.settings       = p;
 
-% CPU copy of Core is kept only for CPU reconstruction.
+% Maintain a CPU copy of the core for dense reconstruction, scheduling,
+% and the optional CPU core-solve path.
 Core_cpu = gather_if_needed(Cwork, use_gpu);
 C_old_cpu = Core_cpu;
+
+% Initial reconstruction and relative residual.
+G0_cpu = cell(Ndim,1);
+for n = 1:Ndim
+    G0_cpu{n} = gather_if_needed(Gwork{n}, use_gpu);
+end
+
+X0_cpu = gather_if_needed(Xwork, use_gpu);
+Y0_cpu = reconstruct_cpu_from_factors(G0_cpu, Core_cpu, Nway);
+
+Out.RES_init = norm(X0_cpu(:) - Y0_cpu(:)) / norm(Y0_cpu(:));
+converged = false;
 
 %% --------------------------- main loop ----------------------------------
 for k = 1:maxit
@@ -376,21 +532,23 @@ for k = 1:maxit
     %% ---------------------- factor updates -----------------------------
     t_factor = tic;
     for num = 1:Ndim
-        dimsG = size(Gwork{num});
+        dimsG = Factors_dims(num,:);
         G2 = unfold_fast(Gwork{num}, dimsG, 2); % [I_n x J]
 
-        % Exact matrix-free factor RHS and Gram.
-        A_ten = tw_factor_rhs_dense_exact_generic(Xwork, Gwork, Cwork, num);
-        TempA = unfold_fast(A_ten, dimsG, 2) + rho * G2;
+        % Compute the exact matrix-free factor right-hand side B_n and
+        % Gram matrix H_n without explicitly forming the design matrix Q_n.
+        B_ten = tw_factor_rhs_dense_exact_generic(Xwork, Gwork, Cwork, num);
 
-        TempB = tw_factor_gram_dense_exact_generic(Gwork, Cwork, num);
-        TempB = add_diag_inplace(TempB, rho);
+        TempA = unfold_fast(B_ten, dimsG, 2) + rho * G2;
+
+        H_n = tw_factor_gram_dense_exact_generic(Gwork, Cwork, num);
+        H_n = add_diag_inplace(H_n, rho);
+
         if enable_symmetrize
-            TempB = 0.5 * (TempB + TempB.');
+            H_n = 0.5 * (H_n + H_n.');
         end
 
-        % Solve TempA / TempB via Cholesky (SPD) with fallback.
-        Sol = solve_right_spd(TempA, TempB);
+        Sol = solve_right_spd(TempA, H_n);
 
         if relax ~= 1
             Sol = (1-relax) * G2 + relax * Sol;
@@ -454,8 +612,8 @@ for k = 1:maxit
     %% --------------------- reconstruction / X update -------------------
     t_recon = tic;
 
-    % Reconstruction on CPU for robustness and speed with the current project code.
-    % Reuse already gathered factors on core-update iterations to avoid a second gather.
+    % Reconstruct the dense tensor on the CPU using the local helper based on
+    % tensor_contraction_explicit. Gather the current factors once per iteration.
     if isempty(G_cpu_cache)
         G_cpu_cache = cell(Ndim,1);
         for n = 1:Ndim
@@ -487,9 +645,11 @@ for k = 1:maxit
         end
 
         if rse < tol
+            converged = true;
             Out.stop_iter = k;
             break;
         end
+        
     end
 end
 
@@ -505,12 +665,19 @@ Out.time_core   = Out.time_core(1:last_valid);
 Out.time_recon  = Out.time_recon(1:last_valid);
 Out.time_total  = Out.time_total(1:last_valid);
 
+% Final diagnostics.
+Out.iterations = k;
+Out.converged  = converged;
+
+% The current GPU implementation uses fixed ranks opts.R.
+Out.final_R = RL;
+
 if gather_output
-    X    = gather_if_needed(Xwork, use_gpu);
+    X_hat    = gather_if_needed(Xwork, use_gpu);
     G    = cellfun(@(x) gather_if_needed(x, use_gpu), Gwork, 'UniformOutput', false);
     Core = gather_if_needed(Cwork, use_gpu);
 else
-    X = Xwork;
+    X_hat = Xwork;
     G = Gwork;
     Core = Cwork;
 end
@@ -525,6 +692,7 @@ function p = parse_opts_gpu(opts)
     p.tol                = get_opt(opts, 'tol', 1e-6);
     p.maxit              = get_opt(opts, 'maxit', 500);
     p.rho                = get_opt(opts, 'rho', 1e-3);
+    p.seed               = get_opt(opts, 'seed', 0);
     p.core_update_after  = get_opt(opts, 'core_update_after', 3);
     p.core_update_every  = get_opt(opts, 'core_update_every', 2);
     p.relax              = get_opt(opts, 'relax', 1.0);
@@ -585,8 +753,8 @@ function M = add_diag_inplace(M, alpha)
     M(1:J+1:end) = M(1:J+1:end) + alpha;
 end
 
-function X = solve_right_spd(A, B)
-% Solve X = A / B where B is SPD.
+function X_hat = solve_right_spd(A, B)
+% Solve X_hat = A / B where B is SPD.
     J = size(B,1);
     if J ~= size(B,2)
         error('solve_right_spd: B must be square.');
@@ -594,15 +762,15 @@ function X = solve_right_spd(A, B)
 
     [L,p] = chol(B, 'lower');
     if p == 0
-        X = (L' \ (L \ A'))';
+        X_hat = (L' \ (L \ A'))';
     else
         tiny = zeros(1, 'like', B) + 1e-12;
         B(1:J+1:end) = B(1:J+1:end) + tiny;
         [L,p] = chol(B, 'lower');
         if p == 0
-            X = (L' \ (L \ A'))';
+            X_hat = (L' \ (L \ A'))';
         else
-            X = A / B;
+            X_hat = A / B;
         end
     end
 end
@@ -660,13 +828,17 @@ end
 %% =========================================================================
 %%                        FACTOR UPDATE HELPERS
 %% =========================================================================
-function A_ten = tw_factor_rhs_dense_exact_generic(X, G, Core, n)
-% Exact factor RHS, GPU/CPU-safe, matched to unfold(...,2).
-% Fully N-generic version based on labelled tensor contractions.
+function B_ten = tw_factor_rhs_dense_exact_generic(X_hat, G, Core, n)
+% Compute the exact factor right-hand side
+%
+%     B_n = X_hat_(n) * Q_n^T
+%
+% without explicitly forming Q_n.
+
     N = numel(G);
     seq = [n+1:N, 1:n-1];
 
-    T = X;
+    T = X_hat;
     labT = labels_I(N);
 
     % Contract all physical modes except I_n and all ring ranks except the
@@ -680,12 +852,15 @@ function A_ten = tw_factor_rhs_dense_exact_generic(X, G, Core, n)
     [T, labT] = labelled_contract_common(T, labT, Core, labels_L(N));
 
     wanted = {label_R(n), label_I(n), label_L(n), label_R(next_idx(n,N))};
-    A_ten = labelled_permute(T, labT, wanted);
+    B_ten = labelled_permute(T, labT, wanted);
 end
 
-function B = tw_factor_gram_dense_exact_generic(G, Core, n)
-% Exact factor Gram, GPU/CPU-safe, matched to GCrest*GCrest'.
-% Fully N-generic version based on labelled tensor contractions.
+function H_n = tw_factor_gram_dense_exact_generic(G, Core, n)
+% Compute the exact factor Gram matrix
+%
+%     H_n = Q_n * Q_n^T
+%
+% without explicitly forming Q_n.
     N = numel(G);
     seq = [n+1:N, 1:n-1];
 
@@ -716,20 +891,19 @@ function B = tw_factor_gram_dense_exact_generic(G, Core, n)
     W = labelled_permute(T, labT, wanted);
 
     J = size(G{n},1) * size(G{n},3) * size(G{n},4);
-    B = reshape(W, J, J);
-    B = 0.5 * (B + B.');
+    H_n = reshape(W, J, J);
 end
 
 %% =========================================================================
 %%                     CORE UPDATE HELPERS (GPU/CPU-EXACT)
 %% =========================================================================
-function b_ten = tw_core_rhs_dense_exact_generic(X, G)
+function b_ten = tw_core_rhs_dense_exact_generic(X_hat, G)
 % Exact Core RHS for arbitrary tensor order N.
     N = numel(G);
-    T = X;
+    T = X_hat;
     labT = labels_I(N);
 
-    % Contract the whole tensor-wheel ring with X over all physical indices
+    % Contract the whole tensor-wheel ring with X_hat over all physical indices
     % and all circular R ranks. The remaining labels are L_1,...,L_N.
     for k = 1:N
         [T, labT] = labelled_contract_common(T, labT, G{k}, labels_G(k,N));
@@ -759,51 +933,56 @@ function H = tw_core_gram_dense_exact_generic(G)
     end
 
     Hten = labelled_permute(T, labT, [labels_L(N), labels_Lp(N)]);
-    H = reshape(Hten, prod(L), prod(L));
-    H = 0.5 * (H + H.');
+    H = reshape(Hten, prod(L), prod(L));   
 end
 
 %% =========================================================================
 %%                    LABELLED TENSOR CONTRACTION HELPERS
 %% =========================================================================
-function [Z, labZ] = labelled_contract_common(X, labX, Y, labY)
-% Contract all labels that occur in both tensors.
+function [Z, labZ] = labelled_contract_common(X_hat, labX, Y, labY)
+% Contract all symbolic labels occurring in both tensors.
 %
-% MATLAB/tensorprod may keep an extra singleton separator dimension in
-% low-order contractions, e.g. for N=3 it can return size
-% [20 20 1 3 3 3] although the labelled result is [20 20 3 3 3].
-% Therefore, after every contraction we reshape to the exact shape implied
-% by the surviving labels.
-    X = normalize_tensor_to_labels(X, labX);
+% The logical tensor orders are passed explicitly to
+% tensor_contraction_explicit so that trailing singleton dimensions
+% associated with unit TW ranks are preserved. The result is subsequently
+% reshaped to the exact logical shape implied by the surviving labels.
+    X_hat = normalize_tensor_to_labels(X_hat, labX);
     Y = normalize_tensor_to_labels(Y, labY);
-    sx = size_with_labels(X, labX);
+    sx = size_with_labels(X_hat, labX);
     sy = size_with_labels(Y, labY);
 
-    [common, ix, iy] = intersect_stable_labels(labX, labY); 
+    [~, ix, iy] = intersect_stable_labels(labX, labY);
     if isempty(ix)
-        Z = tensor_contraction(X, Y, [], []);
-        labZ = [labX, labY];
-    else
-        Z = tensor_contraction(X, Y, ix, iy);
-        labZ = [labX(setdiff_stable(1:numel(labX), ix)), ...
-                labY(setdiff_stable(1:numel(labY), iy))];
-    end
+    Z = tensor_contraction_explicit(X_hat, Y, [], [], numel(labX), numel(labY));
 
+    labZ = [labX, labY];
+    else
+    Z = tensor_contraction_explicit( ...
+        X_hat, Y, ix, iy, ...
+        numel(labX), numel(labY));
+
+    labZ = [labX(setdiff_stable(1:numel(labX), ix)), ...
+            labY(setdiff_stable(1:numel(labY), iy))];
+    end
+    
     expected = expected_sizes_for_labels(labZ, labX, sx, labY, sy);
     Z = reshape_to_label_shape(Z, expected, labZ);
 end
 
-function [Z, labZ] = labelled_contract(X, labX, Y, labY, contractX, contractY)
+function [Z, labZ] = labelled_contract(X_hat, labX, Y, labY, contractX, contractY)
 % Contract explicit label lists contractX and contractY.
-% See labelled_contract_common for the tensorprod singleton-dimension fix.
-    X = normalize_tensor_to_labels(X, labX);
+% Logical tensor orders are supplied explicitly so that unit-rank
+% dimensions are preserved.
+    X_hat = normalize_tensor_to_labels(X_hat, labX);
     Y = normalize_tensor_to_labels(Y, labY);
-    sx = size_with_labels(X, labX);
+    sx = size_with_labels(X_hat, labX);
     sy = size_with_labels(Y, labY);
 
     ix = label_positions(labX, contractX);
     iy = label_positions(labY, contractY);
-    Z = tensor_contraction(X, Y, ix, iy);
+
+    Z = tensor_contraction_explicit(X_hat, Y, ix, iy, numel(labX), numel(labY));
+
     labZ = [labX(setdiff_stable(1:numel(labX), ix)), ...
             labY(setdiff_stable(1:numel(labY), iy))];
 
@@ -811,64 +990,61 @@ function [Z, labZ] = labelled_contract(X, labX, Y, labY, contractX, contractY)
     Z = reshape_to_label_shape(Z, expected, labZ);
 end
 
-function X = normalize_tensor_to_labels(X, lab)
-% Normalize tensor dimensions to match the symbolic label list.
+function X_hat = normalize_tensor_to_labels(X_hat, lab)
+% Normalize an array to the logical tensor order represented by lab.
+% Internal singleton dimensions are preserved. Only omitted trailing
+% singleton dimensions are restored explicitly.
 
-    k = numel(lab);
+k = numel(lab);
 
-    if k == 0
-        if numel(X) ~= 1
-            error('normalize_tensor_to_labels:NonScalar', ...
-                'Expected scalar tensor for empty label list, got size=[%s].', num2str(size(X)));
-        end
-        X = reshape(X, 1, 1);
-        return;
+if k == 0
+    if numel(X_hat) ~= 1
+        error('normalize_tensor_to_labels:NonScalar', ...
+            ['Expected a scalar tensor for an empty label list, ', ...
+             'but received %d elements.'], numel(X_hat));
     end
 
-    sz = size(X);
-
-    if numel(sz) < k
-        sz = [sz, ones(1, k-numel(sz))];
-        X = reshape(X, sz);
-        return;
-    end
-
-    if numel(sz) == k
-        return;
-    end
-
-    extra = numel(sz) - k;
-    singleton_pos = find(sz == 1);
-
-    if numel(singleton_pos) >= extra
-        remove_pos = singleton_pos(1:extra);
-        keep = true(1, numel(sz));
-        keep(remove_pos) = false;
-        new_sz = sz(keep);
-
-        if prod(new_sz) ~= numel(X)
-            error('normalize_tensor_to_labels:ElementMismatch', ...
-                'Cannot remove singleton dimensions from size=[%s] for labels={%s}.', ...
-                num2str(sz), strjoin(lab, ','));
-        end
-
-        if numel(new_sz) == 1
-            X = reshape(X, new_sz(1), 1);
-        else
-            X = reshape(X, new_sz);
-        end
-        return;
-    end
-
-    error('normalize_tensor_to_labels:ExtraNonSingletonDims', ...
-        'Tensor has %d labels but non-singleton extra dimensions: size=[%s], labels={%s}.', ...
-        k, num2str(sz), strjoin(lab, ','));
+    X_hat = reshape(X_hat, 1, 1);
+    return;
 end
 
-function Y = labelled_permute(X, labX, wanted)
-% Permute tensor X from labX order into wanted order.
+% MATLAB represents every vector using at least two physical dimensions.
+% For one symbolic label, all elements form a single logical mode.
+if k == 1
+    X_hat = reshape(X_hat, numel(X_hat), 1);
+    return;
+end
+
+actualSize = size(X_hat);
+
+% Additional dimensions are permitted only if they are trailing singleton
+% dimensions omitted or retained by MATLAB's physical representation.
+if numel(actualSize) > k && any(actualSize(k+1:end) ~= 1)
+    error('normalize_tensor_to_labels:ExtraNonSingletonDims', ...
+        ['Tensor has %d logical labels but additional non-singleton ', ...
+         'dimensions: size=[%s], labels={%s}.'], ...
+        k, num2str(actualSize), strjoin(lab, ','));
+end
+
+logicalSize = ones(1, k);
+for d = 1:k
+    logicalSize(d) = size(X_hat, d);
+end
+
+if prod(logicalSize) ~= numel(X_hat)
+    error('normalize_tensor_to_labels:ElementMismatch', ...
+        ['Cannot reshape tensor of size [%s] to the logical shape ', ...
+         'associated with labels {%s}.'], ...
+        num2str(actualSize), strjoin(lab, ','));
+end
+
+X_hat = reshape(X_hat, logicalSize);
+end
+
+function Y = labelled_permute(X_hat, labX, wanted)
+% Permute tensor X_hat from labX order into wanted order.
 % Normalize first because permute() requires ORDER to cover every actual dimension.
-    X = normalize_tensor_to_labels(X, labX);
+    X_hat = normalize_tensor_to_labels(X_hat, labX);
     if numel(labX) ~= numel(wanted)
         error('labelled_permute:LabelCountMismatch', ...
             'Expected %d output labels, but tensor currently has %d labels. Current={%s}, wanted={%s}.', ...
@@ -876,9 +1052,9 @@ function Y = labelled_permute(X, labX, wanted)
     end
     ord = label_positions(labX, wanted);
     if isequal(ord, 1:numel(ord))
-        Y = X;
+        Y = X_hat;
     else
-        Y = permute(X, ord);
+        Y = permute(X_hat, ord);
     end
 end
 
@@ -894,10 +1070,10 @@ function pos = label_positions(lab, wanted)
     end
 end
 
-function sx = size_with_labels(X, lab)
+function sx = size_with_labels(X_hat, lab)
 % Return exactly one dimension per symbolic label.
-    X = normalize_tensor_to_labels(X, lab);
-    sx = size(X);
+    X_hat = normalize_tensor_to_labels(X_hat, lab);
+    sx = size(X_hat);
     k = numel(lab);
     if k == 0
         sx = [];
@@ -928,9 +1104,10 @@ function expected = expected_sizes_for_labels(labZ, labX, sx, labY, sy)
 end
 
 function Z = reshape_to_label_shape(Z, expected, labZ)
-% Force tensorprod output to the exact labelled shape.
-% This removes tensorprod-created singleton separator axes while preserving
-% the mathematical output order: remaining X labels followed by remaining Y labels.
+% Reshape the contraction result to the exact logical shape implied by
+% the surviving labels. This restores trailing singleton dimensions that
+% MATLAB may omit from the physical size representation while preserving
+% the output order: remaining X labels followed by remaining Y labels.
     if isempty(expected)
         if numel(Z) ~= 1
             error('reshape_to_label_shape:ElementMismatch', ...
@@ -946,26 +1123,41 @@ function Z = reshape_to_label_shape(Z, expected, labZ)
             num2str(size(Z)), num2str(expected), strjoin(labZ, ','));
     end
 
-    if numel(expected) == 1
-        Z = reshape(Z, expected(1), 1);
-    else
-        Z = reshape(Z, expected);
-    end
+   if isscalar(expected)
+      Z = reshape(Z, expected, 1);
+   else
+      Z = reshape(Z, expected);
+   end
 end
 
 
 function [common, ix, iy] = intersect_stable_labels(a, b)
-    common = {};
-    ix = [];
-    iy = [];
-    for i = 1:numel(a)
-        j = find(strcmp(b, a{i}), 1, 'first');
-        if ~isempty(j)
-            common{end+1} = a{i}; 
-            ix(end+1) = i; 
-            iy(end+1) = j; 
-        end
+% Return common labels and their positions while preserving the order of a.
+
+maxMatches = numel(a);
+
+common = cell(1, maxMatches);
+ix = zeros(1, maxMatches);
+iy = zeros(1, maxMatches);
+
+numMatches = 0;
+
+for i = 1:numel(a)
+    j = find(strcmp(b, a{i}), 1, 'first');
+
+    if ~isempty(j)
+        numMatches = numMatches + 1;
+
+        common{numMatches} = a{i};
+        ix(numMatches) = i;
+        iy(numMatches) = j;
     end
+end
+
+% Remove unused preallocated entries.
+common = common(1:numMatches);
+ix = ix(1:numMatches);
+iy = iy(1:numMatches);
 end
 
 function out = setdiff_stable(a, b)
@@ -1010,21 +1202,61 @@ function s = label_Rp(k), s = sprintf('Rp%d', k); end
 %% =========================================================================
 %%                         CPU RECONSTRUCTION HELPER
 %% =========================================================================
-function Xhat_cpu = reconstruct_cpu_from_factors(G_cpu, Core_cpu, Nway)
-% Prefer the project's original CPU reconstruction helper if available.
-    if exist('cores_prod_single_tw', 'file') == 2
-        Xhat_cpu = cores_prod_single_tw(G_cpu, Core_cpu);
-    else
-        % Conservative fallback: reuse the generic exact reconstruction helper
-        % without forcing GPU. This keeps the file runnable even when the
-        % project helper is not on path.
-        opts = struct();
-        opts.method = 'generic';
-        opts.check_sizes = false;
-        opts.force_gpu = false;
-        opts.gather_output = false;
-        Xhat_cpu = cores_prod_single_tw_gpu(G_cpu, Core_cpu, Nway, opts);
-    end
+function Xhat_cpu = reconstruct_cpu_from_factors(G_cpu, Core_cpu, ~)
+%RECONSTRUCT_CPU_FROM_FACTORS Reconstruct the dense TW tensor on the CPU.
+%
+% The reconstruction uses explicitly supplied logical tensor orders so
+% that trailing singleton dimensions associated with unit TW ranks are
+% preserved.
+    Xhat_cpu = cores_prod_single_tw_explicit(G_cpu, Core_cpu);
+end
+
+function X_hat = cores_prod_single_tw_explicit(G, C)
+%CORES_PROD_SINGLE_TW_EXPLICIT Reconstruct a dense TW tensor.
+%
+% The logical tensor orders are passed explicitly to
+% tensor_contraction_explicit. This preserves trailing singleton
+% dimensions when some outer or inner TW ranks are equal to one.
+
+Nc = numel(G);
+
+% After the first contraction, the intermediate tensor has Nc+2 logical
+% dimensions. This number must not be inferred with ndims because MATLAB
+% omits trailing singleton dimensions.
+logicalNdimsX = Nc + 2;
+
+% Contract L_1 between G{1} and the core C.
+%
+% G{1}: [R_1, I_1, L_1, R_2]
+% C:    [L_1, L_2, ..., L_N]
+%
+% Result:
+%       [R_1, I_1, R_2, L_2, ..., L_N]
+X_hat = tensor_contraction_explicit( ...
+    G{1}, C, 3, 1, 4, Nc);
+
+% Reorder the intermediate tensor to:
+%
+%       [L_2, ..., L_N, R_1, I_1, R_2]
+X_hat = permute(X_hat, [4:logicalNdimsX, 1:3]);
+
+% Successively contract L_{n+1} and the connecting outer rank R_{n+1}.
+for n = 1:Nc-2
+    X_hat = tensor_contraction_explicit( ...
+        X_hat, G{n+1}, ...
+        [1, logicalNdimsX], [3, 1], ...
+        logicalNdimsX, 4);
+end
+
+% Close the TW ring by contracting:
+%
+%   L_N with mode 3 of G{N},
+%   R_1 with mode 4 of G{N},
+%   R_N with mode 1 of G{N}.
+X_hat = tensor_contraction_explicit( ...
+    X_hat, G{Nc}, ...
+    [1, 2, logicalNdimsX], [3, 4, 1], ...
+    logicalNdimsX, 4);
 end
 
 %% =========================================================================

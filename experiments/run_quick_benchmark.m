@@ -9,7 +9,7 @@ clear; clc;
 %   3) the GPLv3 baseline Tensor Wheel decomposition implementation.
 %
 % The final console output is a compact benchmark table with:
-%   - relative squared/reconstruction error (RSE),
+%   - relative reconstruction error (RSE),
 %   - execution time,
 %   - sampled peak memory,
 %   - number of iterations.
@@ -74,38 +74,79 @@ bench = 4;
 %   bench = 4 : Standard Tensor Wheel (TW)-format tensor
 %
 % Generate the selected benchmark tensor.
+dataSeed   = 0;
+solverSeed = 0;
+
+rng(dataSeed, 'twister');
 Y = DataBenchmark(bench);
 Ynorm = norm(Y(:));
 tensorSizeText = format_tensor_size(size(Y));
 
 % =============================================================
-% Settings (edit here)
 R = [4 4 4 4];          % Outer TW ranks
 L = [4 4 4 4];          % Inner TW ranks
 
-opts.R     = [R; L];
-opts.maxit = 30;        % Maximum number of PAM iterations
-opts.rho   = 1;         % Proximal/regularization parameter
-opts.tol   = 1e-6;      % Stopping tolerance on relative RSE change
+% Common algorithmic settings used by FastTWD CPU and GPU.
+optsCommon.R                  = [R; L];
+optsCommon.maxit              = 30;
+optsCommon.rho                = 1;
+optsCommon.tol                = 1e-6;
+optsCommon.seed               = solverSeed;
+optsCommon.core_update_after  = 3;
+optsCommon.core_update_every  = 2;
+
+% FastTWD CPU settings.
+optsCpu = optsCommon;
+optsCpu.num_padarray = 0;
+
+% FastTWD GPU settings.
+optsGpu = optsCommon;
+optsGpu.use_gpu       = true;
+optsGpu.gather_output = true;
+optsGpu.precision     = 'double';
+
+% Baseline settings. Include only fields used by the reference solver.
+optsBase.R     = [R; L];
+optsBase.maxit = optsCommon.maxit;
+optsBase.rho   = optsCommon.rho;
+optsBase.tol   = optsCommon.tol;
 
 Omega = [];             % Empty => dense decomposition, no missing entries
+
+% Sampling period used only in the separate memory-measurement runs.
+memoryPollPeriod = 0.02;
 
 % =============================================================
 % FastTWD CPU
 fprintf('Running FastTWD CPU...\n');
-mon_cpu = memmon_start(false, 'cpu', 0.5);
+
+% One-iteration warm-up before the timing run.
+optsCpuWarm = optsCpu;
+optsCpuWarm.maxit = 1;
+fast_twd_cpu(Y, Omega, optsCpuWarm);
+
+% ------------------------- timing run -------------------------
+% No memory polling is active during this run.
 tic;
-try
-    [Ycpu, ~, ~, Outcpu] = fast_twd_cpu(Y, Omega, opts);
-catch
-    [Ycpu, ~, ~, Outcpu] = fast_twd_cpu(Y, opts);
-end
+[Ycpu, ~, ~, Outcpu] = fast_twd_cpu(Y, Omega, optsCpu);
 t_cpu = toc;
-stats_cpu = memmon_stop(mon_cpu);
 
 RSE_cpu   = norm(Y(:) - Ycpu(:)) / Ynorm;
 iters_cpu = get_iter_count(Outcpu);
-mem_cpu   = bytes_to_mb(stats_cpu.peakMatlabBytes);
+
+clear Ycpu Outcpu
+
+% ------------------------- memory run -------------------------
+% The polling overhead does not affect the reported execution time.
+mon_cpu = memmon_start(false, memoryPollPeriod);
+
+[Ymem_cpu, Gmem_cpu, Coremem_cpu, Outmem_cpu] = ...
+    fast_twd_cpu(Y, Omega, optsCpu); %#ok<ASGLU>
+
+stats_cpu = memmon_stop(mon_cpu);
+mem_cpu = bytes_to_mb(stats_cpu.peakMatlabBytes);
+
+clear Ymem_cpu Gmem_cpu Coremem_cpu Outmem_cpu
 
 % =============================================================
 % FastTWD GPU
@@ -116,41 +157,63 @@ if ~is_gpu_available()
     RSE_gpu   = NaN;
     iters_gpu = NaN;
     mem_gpu   = NaN;
+
 else
     g = gpuDevice;
     reset(g);
+    g = gpuDevice;
 
-    % Warm-up GPU to avoid including initialization/JIT overhead in timing.
+    optsGpuWarm = optsGpu;
+    optsGpuWarm.maxit = 1;
+
+    % Initialize the GPU context and execute one solver iteration.
     gpuArray.ones(1024, 1024, 'double');
-    wait(gpuDevice);
+    wait(g);
 
-    try
-        fast_twd_gpu(Y, Omega, opts);
-    catch
-        fast_twd_gpu(Y, opts);
-    end
-    wait(gpuDevice);
+    fast_twd_gpu(Y, Omega, optsGpuWarm);
+    wait(g);
 
-    mon_gpu = memmon_start(true, 'gpu', 0.2);
+    % ------------------------- timing run -------------------------
+    % No memory polling is active during this run.
     tic;
-    try
-        [Yg, ~, ~, Outg] = fast_twd_gpu(Y, Omega, opts);
-    catch
-        [Yg, ~, ~, Outg] = fast_twd_gpu(Y, opts);
-    end
-    wait(gpuDevice);
+    [Yg, ~, ~, Outg] = fast_twd_gpu(Y, Omega, optsGpu);
+    wait(g);
     t_gpu = toc;
-    stats_gpu = memmon_stop(mon_gpu);
 
     RSE_gpu   = norm(Y(:) - Yg(:)) / Ynorm;
     iters_gpu = get_iter_count(Outg);
 
-    % For the GPU row, report sampled peak device memory if available.
-    % If GPU memory could not be sampled, fall back to MATLAB host memory.
+    clear Yg Outg
+
+    % ------------------------- memory run -------------------------
+    % Reset the GPU so that the memory run is not affected by arrays
+    % retained from the timing run.
+    reset(g);
+    g = gpuDevice;
+
+    % Reinitialize the GPU context before starting memory monitoring.
+    gpuArray.ones(1024, 1024, 'double');
+    wait(g);
+
+    fast_twd_gpu(Y, Omega, optsGpuWarm);
+    wait(g);
+
+    optsGpuMem = optsGpu;
+    optsGpuMem.gather_output = false;
+    
+    mon_gpu = memmon_start(true, memoryPollPeriod);
+    
+    [Ymem_gpu, Gmem_gpu, Coremem_gpu, Outmem_gpu] = ...
+        fast_twd_gpu(Y, Omega, optsGpuMem); %#ok<ASGLU>
+    
+    wait(g);
+    stats_gpu = memmon_stop(mon_gpu);
+    
     mem_gpu = bytes_to_mb(stats_gpu.peakGpuBytes);
-    if isnan(mem_gpu)
-        mem_gpu = bytes_to_mb(stats_gpu.peakMatlabBytes);
-    end
+    
+    clear Ymem_gpu Gmem_gpu Coremem_gpu Outmem_gpu
+    wait(g);
+
 end
 
 % =============================================================
@@ -162,41 +225,94 @@ if ~hasBaseline
     RSE_base   = NaN;
     iters_base = NaN;
     mem_base   = NaN;
+
 else
-    mon_base = memmon_start(false, 'base', 1.0);
+    % One-iteration warm-up before the timing run.
+    optsBaseWarm = optsBase;
+    optsBaseWarm.maxit = 1;
+    inc_TW_TC(Y, Omega, optsBaseWarm);
+
+    % ------------------------- timing run -------------------------
+    % No memory polling is active during this run.
     tic;
-    try
-        [Yb, ~, ~, Outb] = inc_TW_TC(Y, Omega, opts);
-    catch
-        [Yb, ~, ~, Outb] = inc_TW_TC(Y, opts);
-    end
+    [Yb, ~, ~, Outb] = inc_TW_TC(Y, Omega, optsBase);
     t_base = toc;
-    stats_base = memmon_stop(mon_base);
 
     RSE_base   = norm(Y(:) - Yb(:)) / Ynorm;
     iters_base = get_iter_count(Outb);
-    mem_base   = bytes_to_mb(stats_base.peakMatlabBytes);
+
+    clear Yb Outb
+
+    % ------------------------- memory run -------------------------
+    % The polling overhead does not affect the reported execution time.
+    mon_base = memmon_start(false, memoryPollPeriod);
+
+    [Ymem_base, Gmem_base, Coremem_base, Outmem_base] = ...
+     inc_TW_TC(Y, Omega, optsBase); %#ok<ASGLU>
+
+    stats_base = memmon_stop(mon_base);
+    mem_base = bytes_to_mb(stats_base.peakMatlabBytes);
+    
+    clear Ymem_base Gmem_base Coremem_base Outmem_base
+    
 end
 
 % =============================================================
 % Final compact benchmark table
+% =============================================================
+
 fprintf('\n');
 fprintf('FastTWD quick benchmark\n');
 fprintf('Benchmark tensor: DataBenchmark(%d)\n', bench);
-fprintf('Tensor size: %s\n\n', tensorSizeText);
+fprintf('Tensor size: %s\n', tensorSizeText);
+fprintf('Data seed: %d\n', dataSeed);
+fprintf('FastTWD initialization seed: %d\n', solverSeed);
+fprintf('Outer ranks: %s\n', mat2str(R));
+fprintf('Inner ranks: %s\n', mat2str(L));
+fprintf('maxit = %d, rho = %.3g, tol = %.3e\n\n', ...
+    optsCommon.maxit, optsCommon.rho, optsCommon.tol);
 
-fprintf('%-15s %12s %12s %14s %8s\n', ...
-    'Method', 'RSE', 'Time [s]', 'Memory [MB]', 'Iter');
-fprintf('%s\n', repmat('-', 1, 65));
+fprintf('%-15s %12s %12s %16s %8s\n', ...
+    'Method', 'RSE', 'Time [s]', 'Sampled memory [MB]', 'Iter');
+
+fprintf('%s\n', repmat('-', 1, 69));
+
 print_result_row('Baseline TW', RSE_base, t_base, mem_base, iters_base);
 print_result_row('FastTWD CPU', RSE_cpu,  t_cpu,  mem_cpu,  iters_cpu);
 print_result_row('FastTWD GPU', RSE_gpu,  t_gpu,  mem_gpu,  iters_gpu);
 
+% ========================================================================
 fprintf('\n');
 fprintf('Notes:\n');
-fprintf('  - CPU memory is sampled peak MATLAB host memory. On non-Windows systems it may be unavailable.\n');
-fprintf('  - GPU memory is sampled peak device memory when a compatible GPU is available.\n');
-fprintf('  - Baseline TW is skipped if inc_TW_TC.m is not found in the expected baseline directory.\n');
+
+fprintf(['  - Execution time and memory are measured in separate solver ', ...
+         'runs, so memory polling does not affect the reported time.\n']);
+
+fprintf(['  - Memory is sampled every %.3f s and represents an approximate ', ...
+         'total footprint rather than an exact allocation peak.\n'], ...
+         memoryPollPeriod);
+
+fprintf(['  - CPU memory is sampled MATLAB host memory. On non-Windows ', ...
+         'systems it may be unavailable.\n']);
+
+fprintf(['  - GPU memory is sampled device memory when a compatible GPU ', ...
+         'is available.\n']);
+
+fprintf(['  - CPU host-memory values and GPU device-memory values are not ', ...
+         'directly comparable.\n']);
+
+fprintf(['  - Baseline TW is skipped if inc_TW_TC.m is not found in the ', ...
+         'expected baseline directory.\n']);
+
+baselineInitialR = max(optsBase.R - 2, 2);
+
+fprintf(['  - The bundled baseline uses its original adaptive-rank scheme: ', ...
+         'it starts from outer ranks %s and inner ranks %s, \n and may ', ...
+         'increase them up to the requested maximum ranks %s and %s.\n'], ...
+         mat2str(baselineInitialR(1,:)), ...
+         mat2str(baselineInitialR(2,:)), ...
+         mat2str(optsBase.R(1,:)), ...
+         mat2str(optsBase.R(2,:)));
 
 % ========================= Helper functions =========================
 function tf = is_gpu_available()
@@ -209,25 +325,41 @@ end
 end
 
 function n = get_iter_count(Out)
-%GET_ITER_COUNT Robustly extracts the number of iterations from an output struct.
-if isstruct(Out) && isfield(Out, 'RSE') && ~isempty(Out.RSE)
+%GET_ITER_COUNT Extract the number of executed iterations.
+
+if isstruct(Out) && isfield(Out, 'iterations') && ...
+        ~isempty(Out.iterations)
+    n = double(Out.iterations);
+
+elseif isstruct(Out) && isfield(Out, 'stop_iter') && ...
+        ~isempty(Out.stop_iter)
+    n = double(Out.stop_iter);
+
+elseif isstruct(Out) && isfield(Out, 'RSE') && ...
+        ~isempty(Out.RSE)
     n = numel(Out.RSE);
-elseif isstruct(Out) && isfield(Out, 'res') && ~isempty(Out.res)
+
+elseif isstruct(Out) && isfield(Out, 'res') && ...
+        ~isempty(Out.res)
     n = numel(Out.res);
-elseif isstruct(Out) && isfield(Out, 'iter') && ~isempty(Out.iter)
+
+elseif isstruct(Out) && isfield(Out, 'iter') && ...
+        ~isempty(Out.iter)
     n = double(Out.iter);
+
 else
     n = NaN;
 end
 end
 
-function print_result_row(methodName, rse, time_s, memory_mb, iterCount)
-%PRINT_RESULT_ROW Prints one aligned row of the final benchmark table.
-fprintf('%-15s %12s %12s %14s %8s\n', ...
+function print_result_row(methodName, rse, time_s, memory_mib, iterCount)
+%PRINT_RESULT_ROW Print one aligned row of the benchmark table.
+
+fprintf('%-15s %12s %12s %16s %8s\n', ...
     methodName, ...
     format_number(rse, '%.3e'), ...
     format_number(time_s, '%.2f'), ...
-    format_number(memory_mb, '%.1f'), ...
+    format_number(memory_mib, '%.1f'), ...
     format_integer(iterCount));
 end
 
@@ -266,75 +398,92 @@ else
 end
 end
 
-function mon = memmon_start(trackGPU, key, period_s)
-%MEMMON_START Starts a lightweight polling timer for approximate peak memory.
-% period_s controls the polling period in seconds.
+function mon = memmon_start(trackGPU, period_s)
+%MEMMON_START Start a lightweight timer for approximate peak-memory sampling.
+%
+% The monitor state is stored in the timer object's UserData property,
+% avoiding global variables.
 
-global MEMMON;
-if isempty(MEMMON)
-    MEMMON = struct();
+if nargin < 2 || isempty(period_s)
+    period_s = 0.5;
 end
-MEMMON.(key) = struct( ...
+
+validateattributes(period_s, {'numeric'}, ...
+    {'scalar', 'real', 'finite', 'positive'}, ...
+    mfilename, 'period_s');
+
+state = struct( ...
     'peakMatlabBytes', 0, ...
     'peakGpuBytes',    0, ...
     'trackGPU',        logical(trackGPU));
 
-if nargin < 3 || isempty(period_s)
-    period_s = 0.5;
-end
-
-% Immediate sample, useful for very short runs.
-memmon_poll(key);
-
-t = timer( ...
+mon = timer( ...
     'ExecutionMode', 'fixedSpacing', ...
     'Period',        period_s, ...
     'BusyMode',      'drop', ...
-    'TimerFcn',      @(~, ~) memmon_poll(key));
+    'UserData',      state, ...
+    'TimerFcn',      @memmon_poll);
 
-start(t);
-mon = struct('timer', t, 'key', key);
+% Collect an immediate sample, which is useful for short runs.
+memmon_poll(mon, []);
+
+start(mon);
 end
 
-function memmon_poll(key)
-%MEMMON_POLL Updates sampled host/GPU peak memory.
-global MEMMON;
+function memmon_poll(mon, ~)
+%MEMMON_POLL Update sampled host and GPU peak memory.
+
+state = mon.UserData;
 
 % MATLAB host memory. The MEMORY function is supported on Windows.
 if ispc
     try
         m = memory;
-        MEMMON.(key).peakMatlabBytes = max( ...
-            MEMMON.(key).peakMatlabBytes, double(m.MemUsedMATLAB));
+        state.peakMatlabBytes = max( ...
+            state.peakMatlabBytes, ...
+            double(m.MemUsedMATLAB));
     catch
+        % Leave the previous value unchanged if host memory is unavailable.
     end
 end
 
 % GPU device memory, if requested.
-if MEMMON.(key).trackGPU
+if state.trackGPU
     try
         g = gpuDevice;
-        used = double(g.TotalMemory - g.AvailableMemory);
-        MEMMON.(key).peakGpuBytes = max(MEMMON.(key).peakGpuBytes, used);
+        usedBytes = double(g.TotalMemory - g.AvailableMemory);
+
+        state.peakGpuBytes = max( ...
+            state.peakGpuBytes, ...
+            usedBytes);
     catch
+        % Leave the previous value unchanged if GPU memory is unavailable.
     end
 end
+
+mon.UserData = state;
 end
 
 function stats = memmon_stop(mon)
-%MEMMON_STOP Stops the polling timer and returns sampled peak memory.
-global MEMMON;
+%MEMMON_STOP Stop the timer and return the sampled peak-memory statistics.
 
+% Stop periodic callbacks before collecting the final sample.
 try
-    memmon_poll(mon.key);
+    stop(mon);
 catch
 end
 
+% Collect one final sample while the solver outputs are still allocated.
 try
-    stop(mon.timer);
-    delete(mon.timer);
+    memmon_poll(mon, []);
 catch
 end
 
-stats = MEMMON.(mon.key);
+% Retrieve the monitor state before deleting the timer.
+stats = mon.UserData;
+
+try
+    delete(mon);
+catch
+end
 end

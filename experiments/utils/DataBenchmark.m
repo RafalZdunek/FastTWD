@@ -30,7 +30,7 @@ switch bench
         I = [20 20 20 20];
         R = [4 4 4 4];
              
-        U = cell([length(I),1]);
+        G = cell([length(I),1]);
         for n = 1:length(I)
             if n < length(I)
                G{n} = max(0,randn([R(n) I(n) R(n+1)]));

@@ -1,5 +1,5 @@
 clear; clc;
-addpath(fullfile(pwd, 'Baseline_TW_TC'));
+addpath(fullfile(fileparts(pwd), 'third_party', 'Baseline_TW_TC'));
 
 % =========================================================================
 % Sweep over inner ranks L with two measurement modes:
